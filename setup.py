@@ -1,11 +1,11 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='odeformer',
-    version='0.1.6',
-    description="Transformers for symbolic regression of ODEs",
-    author="Stéphane d'Ascoli",
-    author_email="stephane.dascoli@gmail.com",
+    name='odefinterp',
+    version='0.1.0',
+    description="ODEFormer but tweaked to aid interpretability",
+    author="Soumyadeep Bose",
+    author_email="soumyadeepboseee@gmail.com",
     packages=find_packages(),
     license="MIT",
     #download_url="https://github.com/sdascoli/odeformer/archive/refs/tags/v_01.tar.gz",
