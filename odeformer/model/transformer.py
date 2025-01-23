@@ -11,6 +11,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
 
 from odeformer.model.embedders import TwoHotEmbedder
 
@@ -194,7 +197,7 @@ class TransformerFFN(nn.Module):
 
 class TransformerModel(nn.Module):
 
-    STORE_OUTPUTS = False
+    STORE_OUTPUTS = True
 
     def __init__(
         self,
@@ -407,6 +410,7 @@ class TransformerModel(nn.Module):
         # all layer outputs
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs = []
+            self.intermediate_tokens = []
 
         # embeddings
         if not self.use_prior_embeddings:
@@ -453,6 +457,15 @@ class TransformerModel(nn.Module):
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
             if TransformerModel.STORE_OUTPUTS and not self.training:
                 self.outputs.append(tensor.detach().cpu())
+                #print(i, tensor.detach().cpu())
+
+            if self.STORE_OUTPUTS and self.is_decoder:
+                #print(tensor.size()) # [x, 1, 512]
+                reshaped_tensor = tensor.view(-1, self.dim) # [x, 512]
+                lens_tokens = self.decode_logits(reshaped_tensor)
+                self.intermediate_tokens.append((i, lens_tokens))
+        
+        self.plot_tokens()
 
         # update cache length
         if use_cache:
@@ -462,6 +475,65 @@ class TransformerModel(nn.Module):
         tensor = tensor.transpose(0, 1)
 
         return tensor
+    
+    def decode_logits(self, tensor):
+        decoded_tokens = []
+        for step_logits in tensor:
+            lens_scores = self.proj(step_logits)
+            lens_probs = F.softmax(lens_scores, dim=-1)
+            token_idx = torch.argmax(lens_probs, dim=-1).item()
+            token = self.id2word.get(token_idx, "<UNK>")  # fallback to <UNK>
+            decoded_tokens.append(token)
+        return decoded_tokens
+    
+    def plot_tokens(self):
+        data = self.intermediate_tokens
+        id2word_size = self.n_words
+        plot_title = "Token Table Chart"
+
+        # ensure we plot decoder blocks only
+        if len(data) == 0:
+            print("Skipping encoder block...")
+
+        else:
+            row_headers = [f"decoder {i}" for i in range(len(data))]
+            col_headers = [f"beam {i}" for i in range(len(data[0][1]))]
+            rows = len(data[0][1])
+            cols = len(data)
+            norm = mcolors.Normalize(vmin=0, vmax=id2word_size - 1)
+            cmap = plt.cm.get_cmap('tab20', id2word_size)
+
+            fig, ax = plt.subplots(figsize=(rows, cols))
+            ax.axis('tight')
+            ax.axis('off')
+
+            # preparing the table's data
+            table_data = []
+            table_colors = []
+
+            for i in range(cols):
+                row = []
+                color_row = []
+                for j in range(rows):
+                    token = data[i][1][j]
+                    row.append(token)
+                    color_row.append(cmap(norm(self.word2id.get(token, 0))))
+                table_data.append(row)
+                table_colors.append(color_row)
+
+            # making the table plot
+            table = plt.table(
+                cellText=table_data,
+                cellColours=table_colors,
+                rowLabels=row_headers,
+                colLabels=col_headers,
+                loc='center',
+                cellLoc='center',
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            plt.title(plot_title)
+            plt.show()
 
     def predict(self, tensor, pred_mask, y, get_scores):
         """
