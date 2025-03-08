@@ -67,7 +67,7 @@ class ModelWrapper(nn.Module):
             bs = encoded.shape[0]
 
             ### Greedy solution.
-            generations, _, two_hot_constant_masks = decoder.generate(
+            """generations, _, two_hot_constant_masks = decoder.generate(
                 encoded,
                 x_len,
                 sample_temperature=None,
@@ -91,7 +91,9 @@ class ModelWrapper(nn.Module):
                     )
                 )
                 for i in range(bs)
-            ]
+            ]"""
+            
+            generations = [[None] for _ in range(bs)]  # Initialize with placeholder for each batch item
 
             if self.beam_type == "search":
                 _, _, search_generations = decoder.generate_beam(

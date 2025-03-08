@@ -9,6 +9,7 @@ import copy
 import time as _time
 import numpy as np
 import torch
+import json
 from collections import defaultdict
 from odeformer.metrics import compute_metrics
 from sklearn.base import BaseEstimator
@@ -31,6 +32,9 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
 
     def __init__(self,
                 model=None,
+                plot_token_charts=True,
+                store_attentions=True,
+                show_topk_tokens=0,
                 from_pretrained=False,
                 max_input_points=10000,
                 rescale=True,
@@ -42,6 +46,18 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
         self.model = model
         self.rescale = rescale
         self.params = params
+        with open("all_intermediate_tokens.json", "w") as file:
+            json.dump({}, file)
+        with open("all_stored_attentions.json", "w") as file:
+            json.dump({}, file)
+        with open("all_topk.json", "w") as file:
+            json.dump({}, file)
+        with open("topk.txt", "w") as file:
+            file.write(str(show_topk_tokens))
+        with open("plot_token_charts.txt", "w") as file:
+            file.write(str(plot_token_charts))
+        with open("store_attentions.txt", "w") as file:
+            file.write(str(store_attentions))
         if from_pretrained:
             self.load_pretrained()
         for kwarg, val in model_kwargs.items():
@@ -69,6 +85,27 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
         model = torch.load(model_path)
         print("Loaded pretrained model")
         self.model = model
+
+    def get_intermediate_tokens(self):
+        try:
+            with open("all_intermediate_tokens.json") as file:
+                return json.load(file)
+        except:
+            return "No intermediate tokens found"
+        
+    def get_stored_attentions(self):
+        try:
+            with open("all_stored_attentions.json") as file:
+                return json.load(file)
+        except:
+            return "No stored attentions found"
+        
+    def get_topk(self):
+        try:
+            with open("all_topk.json") as file:
+                return json.load(file)
+        except:
+            return "No topk tokens found"
 
     def set_args(self, args={}):
         for arg, val in args.items():
@@ -131,9 +168,12 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
 
         # permute trajectories so that when bagging the model doesn't get chunks
         for i, (scaled_time, scaled_trajectory) in enumerate(zip(scaled_times, scaled_trajectories)):
-            permutation = np.random.permutation(len(scaled_time))
-            scaled_times[i] = scaled_time[permutation]
-            scaled_trajectories[i] = scaled_trajectory[permutation]
+            # permutation = np.random.permutation(len(scaled_time))
+            # scaled_times[i] = scaled_time[permutation]
+            # scaled_trajectories[i] = scaled_trajectory[permutation]
+
+            scaled_times[i] = scaled_time[:]
+            scaled_trajectories[i] = scaled_trajectory[:]
 
         # split into bags of size max_input_points
         inputs, inputs_ids = [], []

@@ -7,13 +7,13 @@
 from logging import getLogger
 import math
 import itertools
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
+import json
 
 from odeformer.model.embedders import TwoHotEmbedder
 
@@ -92,7 +92,7 @@ class MultiHeadAttention(nn.Module):
                 torch.tensor(1.0 / math.sqrt(dim // n_heads))
             )
 
-    def forward(self, input, mask=None, kv=None, use_cache=False):
+    def forward(self, input, mask=None, kv=None, use_cache=False, return_attn=False):
         """
         Self-attention (if kv is None)
         or attention over source sentence (provided by kv).
@@ -160,6 +160,7 @@ class MultiHeadAttention(nn.Module):
         weights = F.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (bs, n_heads, qlen, klen)
+        return_weights = weights#.detach().cpu()
         weights = F.dropout(
             weights, p=self.dropout, training=self.training
         )  # (bs, n_heads, qlen, klen)
@@ -169,6 +170,8 @@ class MultiHeadAttention(nn.Module):
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs = weights.detach().cpu()
 
+        if return_attn:
+            return self.out_lin(context), return_weights
         return self.out_lin(context)
 
 
@@ -411,6 +414,8 @@ class TransformerModel(nn.Module):
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs = []
             self.intermediate_tokens = []
+            self.topk = []
+            self.stored_attn_weights = {"decoder": [], "encoder": [], "cross_attention": []}
 
         # embeddings
         if not self.use_prior_embeddings:
@@ -429,26 +434,49 @@ class TransformerModel(nn.Module):
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs.append(tensor.detach().cpu())
+        
+        # should we show token charts
+        with open("plot_token_charts.txt", "r") as file:
+            plot_token_charts = str(file.read()).strip()
+            plot_token_charts = True if plot_token_charts == "True" else False
+            # print("plot_token_charts: ", plot_token_charts, type(plot_token_charts))
+        
+        # should we store attentions
+        with open("store_attentions.txt", "r") as file:
+            store_attentions = str(file.read()).strip()
+            store_attentions = True if store_attentions == "True" else False
+            # print("store_attentions: ", store_attentions, type(store_attentions))
+
+        with open("topk.txt", "r") as file:
+            k = int(file.read())
 
         # transformer layers
         for i in range(self.n_layers):
 
             # self attention
             self.attentions[i].cache = self.cache
-            attn = self.attentions[i](tensor, attn_mask, use_cache=use_cache)
+            attn, attn_weights = self.attentions[i](tensor, attn_mask, use_cache=use_cache, return_attn=True)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
             tensor = tensor + attn
             tensor = self.layer_norm1[i](tensor)
 
+            # store self-attention weights
+            if self.is_decoder:
+                self.stored_attn_weights["decoder"].append(attn_weights.detach().cpu().numpy().tolist())
+            else:
+                self.stored_attn_weights["encoder"].append(attn_weights.detach().cpu().numpy().tolist())
+
             # encoder attention (for decoder only)
             if self.is_decoder and src_enc is not None and self.use_cross_attention: 
                 self.encoder_attn[i].cache = self.cache
-                attn = self.encoder_attn[i](
-                    tensor, src_mask, kv=src_enc, use_cache=use_cache
+                attn, cross_attn_weights = self.encoder_attn[i](
+                    tensor, src_mask, kv=src_enc, use_cache=use_cache, return_attn=True
                 )
                 attn = F.dropout(attn, p=self.dropout, training=self.training)
                 tensor = tensor + attn
                 tensor = self.layer_norm15[i](tensor)
+                # store cross-attention weights
+                self.stored_attn_weights["cross_attention"].append(cross_attn_weights.detach().cpu().numpy().tolist())
 
             # FFN
             tensor = tensor + self.ffns[i](tensor)
@@ -462,10 +490,16 @@ class TransformerModel(nn.Module):
             if self.STORE_OUTPUTS and self.is_decoder:
                 #print(tensor.size()) # [x, 1, 512]
                 reshaped_tensor = tensor.view(-1, self.dim) # [x, 512]
-                lens_tokens = self.decode_logits(reshaped_tensor)
+                lens_tokens, topk = self.decode_logits(reshaped_tensor, k)
                 self.intermediate_tokens.append((i, lens_tokens))
+                self.topk.append(topk)
         
-        self.plot_tokens()
+        if plot_token_charts:
+            self.plot_tokens()
+        self.store_in_json()
+        self.store_topk()
+        if store_attentions:
+            self.store_attn_weights()
 
         # update cache length
         if use_cache:
@@ -476,24 +510,40 @@ class TransformerModel(nn.Module):
 
         return tensor
     
-    def decode_logits(self, tensor):
+    def decode_logits(self, tensor, k=10):
         decoded_tokens = []
+        topk = []
         for step_logits in tensor:
             lens_scores = self.proj(step_logits)
             lens_probs = F.softmax(lens_scores, dim=-1)
             token_idx = torch.argmax(lens_probs, dim=-1).item()
             token = self.id2word.get(token_idx, "<UNK>")  # fallback to <UNK>
+            
+            # get the top k tokens and their probabilities
+            if k!=0:
+                topk_probs, topk_idx = torch.topk(lens_probs, k)
+                topk_tokens = [self.id2word.get(idx.item(), "<UNK>") for idx in topk_idx]
+                topk.append((topk_tokens, topk_probs.tolist()))
+            
             decoded_tokens.append(token)
-        return decoded_tokens
+        
+        return decoded_tokens, topk
     
     def plot_tokens(self):
         data = self.intermediate_tokens
         id2word_size = self.n_words
         plot_title = "Token Table Chart"
+        # be_suspicious = True
+        # with open("imp_params.txt", "r") as file:
+            # be_suspicious = str(file.read()).strip()
+            # be_suspicious = True if be_suspicious == "True" else False
+            # print("be_suspicious: ", be_suspicious, type(be_suspicious))
 
-        # ensure we plot decoder blocks only
+        # ensure we plot relevant decoder blocks only
         if len(data) == 0:
             print("Skipping encoder block...")
+        elif len(data[0][1]) == 1:
+            print("Skipping suspicious single beam business...")
 
         else:
             row_headers = [f"decoder {i}" for i in range(len(data))]
@@ -503,7 +553,7 @@ class TransformerModel(nn.Module):
             norm = mcolors.Normalize(vmin=0, vmax=id2word_size - 1)
             cmap = plt.cm.get_cmap('tab20', id2word_size)
 
-            fig, ax = plt.subplots(figsize=(rows, cols))
+            fig, ax = plt.subplots(figsize=(cols, rows))
             ax.axis('tight')
             ax.axis('off')
 
@@ -534,6 +584,42 @@ class TransformerModel(nn.Module):
             table.set_fontsize(10)
             plt.title(plot_title)
             plt.show()
+
+    def store_in_json(self):
+        new_value = self.intermediate_tokens
+        if len(new_value) != 0 and len(new_value[0][1]) != 1:
+            with open("all_intermediate_tokens.json", "r") as file:
+                data = json.load(file)
+            num_pairs = len(data)
+            new_key = "token_"+str(num_pairs)
+            data[new_key] = new_value
+            with open("all_intermediate_tokens.json", "w") as file:
+                json.dump(data, file, indent=4)
+
+    def store_attn_weights(self):
+        new_value = self.stored_attn_weights
+        with open("all_stored_attentions.json", "r") as file:
+            data = json.load(file)
+        num_pairs = len(data)
+        if num_pairs == 0 and len(new_value["decoder"]) == 0 and len(new_value["cross_attention"]) == 0:
+            new_key = "encoder"
+            data [new_key] = new_value["encoder"]
+        else:
+            new_key = "token_"+str(num_pairs-1)
+            _ = new_value.pop("encoder")
+            data[new_key] = new_value
+        with open("all_stored_attentions.json", "w") as file:
+            json.dump(data, file, indent=4)
+
+    def store_topk(self):
+        new_value = self.topk
+        with open("all_topk.json", "r") as file:
+            data = json.load(file)
+        num_pairs = len(data)
+        new_key = "token_"+str(num_pairs)
+        data[new_key] = new_value
+        with open("all_topk.json", "w") as file:
+            json.dump(data, file, indent=4)
 
     def predict(self, tensor, pred_mask, y, get_scores):
         """
