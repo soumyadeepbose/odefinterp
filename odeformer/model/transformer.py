@@ -157,10 +157,12 @@ class MultiHeadAttention(nn.Module):
             )  # (bs, n_heads, qlen, klen)
             scores.masked_fill_(mask, -float("inf"))  # (bs, n_heads, qlen, klen)
 
+        # returning pre-softmax attentions
+        return_weights_pre_softmax = scores
         weights = F.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (bs, n_heads, qlen, klen)
-        return_weights = weights#.detach().cpu()
+        # return_weights = weights#.detach().cpu()
         weights = F.dropout(
             weights, p=self.dropout, training=self.training
         )  # (bs, n_heads, qlen, klen)
@@ -171,7 +173,42 @@ class MultiHeadAttention(nn.Module):
             self.outputs = weights.detach().cpu()
 
         if return_attn:
-            return self.out_lin(context), return_weights
+
+            # value-weighted attentions
+            v_norms = torch.norm(v, p=2, dim=-1, keepdim=True)  # (bs, n_heads, klen, 1)
+            info_weighted_attn = weights * v_norms.transpose(2, 3)  # (bs, n_heads, qlen, klen)
+
+            # pre or post softmax attentions?
+            with open("store_attentions_pre_softmax.txt", "r") as file:
+                store_attn_pre_softmax = str(file.read()).strip()
+                store_attn_pre_softmax = True if store_attn_pre_softmax == "True" else False
+            with open("store_wov.txt", "r") as file:
+                store_wov = str(file.read()).strip()
+                store_wov = True if store_wov == "True" else False
+            with open("store_value_weighted_attn.txt", "r") as file:
+                store_value_weighted_attn = str(file.read()).strip()
+                store_value_weighted_attn = True if store_value_weighted_attn == "True" else False
+            
+            # calculate Wov matrix
+            v_shape = self.v_lin.weight.shape  # shape: (dim, src_dim)
+            o_shape = self.out_lin.weight.shape  # shape: (dim, dim)
+            wov = torch.zeros(o_shape[0], v_shape[1])
+            # for self attentions src_dim and dim are equal
+            if store_wov and v_shape[0] == o_shape[1]:
+                wov = torch.mm(self.out_lin.weight, self.v_lin.weight)
+
+            if store_attn_pre_softmax:
+                return_weights = return_weights_pre_softmax
+            else:
+                return_weights = F.softmax(return_weights_pre_softmax.float(), dim=-1).type_as(
+                    return_weights_pre_softmax
+                )
+
+            if store_value_weighted_attn:
+                return_weights = info_weighted_attn
+            
+            return self.out_lin(context), return_weights, wov
+            
         return self.out_lin(context)
 
 
@@ -416,6 +453,7 @@ class TransformerModel(nn.Module):
             self.intermediate_tokens = []
             self.topk = []
             self.stored_attn_weights = {"decoder": [], "encoder": [], "cross_attention": []}
+            self.stored_wov = {"decoder": [], "encoder": []}
 
         # embeddings
         if not self.use_prior_embeddings:
@@ -450,12 +488,20 @@ class TransformerModel(nn.Module):
         with open("topk.txt", "r") as file:
             k = int(file.read())
 
+        with open("ignore_enc_layers.txt", "r") as file:
+            ignore_enc_layers = list(map(int, str(file.read()).split()))
+
         # transformer layers
         for i in range(self.n_layers):
 
+            # ignore some encoder layers
+            if not self.is_decoder and i in ignore_enc_layers:
+                print(f"Skipping encoder layer {i}...")
+                continue
+
             # self attention
             self.attentions[i].cache = self.cache
-            attn, attn_weights = self.attentions[i](tensor, attn_mask, use_cache=use_cache, return_attn=True)
+            attn, attn_weights, wov = self.attentions[i](tensor, attn_mask, use_cache=use_cache, return_attn=True)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
             tensor = tensor + attn
             tensor = self.layer_norm1[i](tensor)
@@ -466,12 +512,20 @@ class TransformerModel(nn.Module):
             else:
                 self.stored_attn_weights["encoder"].append(attn_weights.detach().cpu().numpy().tolist())
 
+            # store self-attention Wov matrices
+            if self.is_decoder:
+                self.stored_wov["decoder"].append(wov.numpy().tolist())
+            else:
+                self.stored_wov["encoder"].append(wov.numpy().tolist())
+
             # encoder attention (for decoder only)
             if self.is_decoder and src_enc is not None and self.use_cross_attention: 
                 self.encoder_attn[i].cache = self.cache
-                attn, cross_attn_weights = self.encoder_attn[i](
+                returned = self.encoder_attn[i](
                     tensor, src_mask, kv=src_enc, use_cache=use_cache, return_attn=True
                 )
+                # print(len(returned))
+                attn, cross_attn_weights, zeros_wov = returned
                 attn = F.dropout(attn, p=self.dropout, training=self.training)
                 tensor = tensor + attn
                 tensor = self.layer_norm15[i](tensor)
@@ -500,6 +554,7 @@ class TransformerModel(nn.Module):
         self.store_topk()
         if store_attentions:
             self.store_attn_weights()
+            self.store_Wov()
 
         # update cache length
         if use_cache:
@@ -603,12 +658,27 @@ class TransformerModel(nn.Module):
         num_pairs = len(data)
         if num_pairs == 0 and len(new_value["decoder"]) == 0 and len(new_value["cross_attention"]) == 0:
             new_key = "encoder"
-            data [new_key] = new_value["encoder"]
+            data[new_key] = new_value["encoder"]
         else:
             new_key = "token_"+str(num_pairs-1)
             _ = new_value.pop("encoder")
             data[new_key] = new_value
         with open("all_stored_attentions.json", "w") as file:
+            json.dump(data, file, indent=4)
+
+    def store_Wov(self):
+        new_value = self.stored_wov
+        with open("all_stored_wov.json", "r") as file:
+            data = json.load(file)
+        num_pairs = len(data)
+        if num_pairs == 0 and len(new_value["decoder"]) == 0:
+            new_key = "encoder"
+            data[new_key] = new_value["encoder"]
+        else:
+            new_key = "token_"+str(num_pairs-1)
+            _ = new_value.pop("encoder")
+            data[new_key] = new_value
+        with open("all_stored_wov.json", "w") as file:
             json.dump(data, file, indent=4)
 
     def store_topk(self):

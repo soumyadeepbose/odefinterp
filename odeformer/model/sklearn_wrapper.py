@@ -34,8 +34,12 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
                 model=None,
                 plot_token_charts=True,
                 store_attentions=True,
+                store_attn_pre_softmax=False,
+                store_wov=False,
+                store_value_weighted_attn=False,
                 show_topk_tokens=0,
                 from_pretrained=False,
+                ignore_enc_layers=[],
                 max_input_points=10000,
                 rescale=True,
                 params=None,
@@ -50,6 +54,8 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
             json.dump({}, file)
         with open("all_stored_attentions.json", "w") as file:
             json.dump({}, file)
+        with open("all_stored_wov.json", "w") as file:
+            json.dump({}, file)
         with open("all_topk.json", "w") as file:
             json.dump({}, file)
         with open("topk.txt", "w") as file:
@@ -58,6 +64,14 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
             file.write(str(plot_token_charts))
         with open("store_attentions.txt", "w") as file:
             file.write(str(store_attentions))
+        with open("store_attentions_pre_softmax.txt", "w") as file:
+            file.write(str(store_attn_pre_softmax))
+        with open("ignore_enc_layers.txt", "w") as file:
+            file.write(str(" ".join(map(str, ignore_enc_layers))))
+        with open("store_value_weighted_attn.txt", "w") as file:
+            file.write(str(store_value_weighted_attn))
+        with open("store_wov.txt", "w") as file:
+            file.write(str(store_wov))
         if from_pretrained:
             self.load_pretrained()
         for kwarg, val in model_kwargs.items():
@@ -99,6 +113,13 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
                 return json.load(file)
         except:
             return "No stored attentions found"
+    
+    def get_stored_wov(self):
+        try:
+            with open("all_stored_wov.json") as file:
+                return json.load(file)
+        except:
+            return "No stored Wov matrices found"
         
     def get_topk(self):
         try:

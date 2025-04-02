@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='odefinterp',
-    version='0.1.21',
+    version='0.1.27',
     description="ODEFormer but tweaked to aid interpretability",
     author="Soumyadeep Bose",
     author_email="soumyadeepboseee@gmail.com",
