@@ -376,7 +376,7 @@ class TransformerModel(nn.Module):
             assert not self.use_prior_embeddings
             self.proj = nn.Linear(
                 self.dim, self.n_words, bias=True
-            )  ##added index for eos and tab
+            )
             if params.share_inout_emb:
                 self.proj.weight = self.embeddings.weight
 
@@ -451,6 +451,7 @@ class TransformerModel(nn.Module):
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs = []
             self.intermediate_tokens = []
+            self.intermediate_logits = []
             self.topk = []
             self.stored_attn_weights = {"decoder": [], "encoder": [], "cross_attention": []}
             self.stored_wov = {"decoder": [], "encoder": []}
@@ -461,17 +462,48 @@ class TransformerModel(nn.Module):
         else:
             tensor = x
 
+        self.original_tensor = tensor.clone()
+
         if not self.use_cross_attention and self.is_decoder and src_enc is not None:
             src_enc = src_enc.mean(dim=1)  # B,D
             tensor[:,0,:] = src_enc
 
         if self.position_embeddings is not None:
             tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
+
+        # storing params before layer_norm_emb
+        self.tensor_mean = tensor.mean(dim=-1, keepdim=True)
+        self.tensor_var = tensor.var(dim=-1, keepdim=True)
+        self.layer_norm_emb_gamma = self.layer_norm_emb.weight.detach().cpu().numpy()
+        self.layer_norm_emb_beta = self.layer_norm_emb.bias.detach().cpu().numpy()
+
         tensor = self.layer_norm_emb(tensor)
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
         if TransformerModel.STORE_OUTPUTS and not self.training:
             self.outputs.append(tensor.detach().cpu())
+
+        # reverse the effect of tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+        rev_tensor = tensor / mask.unsqueeze(-1).to(tensor.dtype)
+        # reverse the effect of tensor = F.dropout(tensor, p=self.dropout, training=self.training)
+        rev_tensor = rev_tensor * (1 - self.dropout)
+        # reverse the effect of tensor = self.layer_norm_emb(tensor)
+        rev_tensor = ((rev_tensor - self.layer_norm_emb_beta) / self.layer_norm_emb_gamma) * torch.sqrt(self.tensor_var + 1e-12) + self.tensor_mean
+        # remove positional embeddings if required
+        if self.position_embeddings is not None:
+            rev_tensor = rev_tensor - self.position_embeddings(positions).expand_as(tensor)
+
+        # make a text file to store tensor
+        if not self.is_decoder:
+            with open("tensor.txt", "a") as file:
+                file.write(str(x.detach().cpu().numpy().tolist()))
+                file.write("\n")
+                file.write(str(self.original_tensor.detach().cpu().numpy().tolist()))
+                file.write("\n")
+                file.write(str(tensor.detach().cpu().numpy().tolist()))
+                file.write("\n")
+                file.write(str(rev_tensor.detach().cpu().numpy().tolist()))
+                file.write("\n")
         
         # should we show token charts
         with open("plot_token_charts.txt", "r") as file:
@@ -485,11 +517,28 @@ class TransformerModel(nn.Module):
             store_attentions = True if store_attentions == "True" else False
             # print("store_attentions: ", store_attentions, type(store_attentions))
 
+        with open("store_intermediate_logits.txt", "r") as file:
+            store_intermediate_logits = str(file.read()).strip()
+            store_intermediate_logits = True if store_intermediate_logits == "True" else False
+
+        with open("store_only_enc_self_attns.txt", "r") as file:
+            store_only_enc_self_attns = str(file.read()).strip()
+            store_only_enc_self_attns = True if store_only_enc_self_attns == "True" else False
+
         with open("topk.txt", "r") as file:
             k = int(file.read())
 
         with open("ignore_enc_layers.txt", "r") as file:
             ignore_enc_layers = list(map(int, str(file.read()).split()))
+
+        with open("store_enc_outputs.txt", "r") as file:
+            store_enc_outputs = str(file.read()).strip()
+            store_enc_outputs = True if store_enc_outputs == "True" else False
+
+        enc_outputs_before_attn = []
+        enc_outputs_after_attn = []
+        enc_outputs_before_ffn = []
+        enc_outputs_after_ffn = []
 
         # transformer layers
         for i in range(self.n_layers):
@@ -503,19 +552,23 @@ class TransformerModel(nn.Module):
             self.attentions[i].cache = self.cache
             attn, attn_weights, wov = self.attentions[i](tensor, attn_mask, use_cache=use_cache, return_attn=True)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
+            tensor_before_attn = tensor.clone()
             tensor = tensor + attn
+            # saving enc_outputs before and after self-attention
+            if self.is_encoder and store_enc_outputs:
+                print("Storing before and after encoder attn tensors...")
+                enc_outputs_before_attn.append(tensor_before_attn.detach().cpu().numpy().tolist())
+                enc_outputs_after_attn.append(tensor.detach().cpu().numpy().tolist())
+            # print(tensor.size())
             tensor = self.layer_norm1[i](tensor)
 
-            # store self-attention weights
+            # store self-attention weights and Wov matrices
             if self.is_decoder:
-                self.stored_attn_weights["decoder"].append(attn_weights.detach().cpu().numpy().tolist())
+                if not store_only_enc_self_attns:
+                    self.stored_attn_weights["decoder"].append(attn_weights.detach().cpu().numpy().tolist())
+                    self.stored_wov["decoder"].append(wov.numpy().tolist())
             else:
                 self.stored_attn_weights["encoder"].append(attn_weights.detach().cpu().numpy().tolist())
-
-            # store self-attention Wov matrices
-            if self.is_decoder:
-                self.stored_wov["decoder"].append(wov.numpy().tolist())
-            else:
                 self.stored_wov["encoder"].append(wov.numpy().tolist())
 
             # encoder attention (for decoder only)
@@ -530,10 +583,17 @@ class TransformerModel(nn.Module):
                 tensor = tensor + attn
                 tensor = self.layer_norm15[i](tensor)
                 # store cross-attention weights
-                self.stored_attn_weights["cross_attention"].append(cross_attn_weights.detach().cpu().numpy().tolist())
+                if not store_only_enc_self_attns:
+                    self.stored_attn_weights["cross_attention"].append(cross_attn_weights.detach().cpu().numpy().tolist())
 
             # FFN
+            tensor_before_ffn = tensor.clone()
             tensor = tensor + self.ffns[i](tensor)
+            # saving enc_outputs before and after FFN
+            if self.is_encoder and store_enc_outputs:
+                print("Storing before and after encoder ffn tensors...")
+                enc_outputs_before_ffn.append(tensor_before_ffn.detach().cpu().numpy().tolist())
+                enc_outputs_after_ffn.append(tensor.detach().cpu().numpy().tolist())
             tensor = self.layer_norm2[i](tensor)
 
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
@@ -542,8 +602,14 @@ class TransformerModel(nn.Module):
                 #print(i, tensor.detach().cpu())
 
             if self.STORE_OUTPUTS and self.is_decoder:
+
                 #print(tensor.size()) # [x, 1, 512]
                 reshaped_tensor = tensor.view(-1, self.dim) # [x, 512]
+
+                # storing intermediate logits
+                if store_intermediate_logits:
+                    self.intermediate_logits.append(reshaped_tensor.detach().cpu().numpy().tolist())
+                
                 lens_tokens, topk = self.decode_logits(reshaped_tensor, k)
                 self.intermediate_tokens.append((i, lens_tokens))
                 self.topk.append(topk)
@@ -552,9 +618,21 @@ class TransformerModel(nn.Module):
             self.plot_tokens()
         self.store_in_json()
         self.store_topk()
+        self.store_intermediate_logits_func()
+        if self.is_encoder:
+            self.store_enc_outputs_func(enc_outputs_before_attn, 
+                                        enc_outputs_after_attn,
+                                        enc_outputs_before_ffn,
+                                        enc_outputs_after_ffn)
+
         if store_attentions:
-            self.store_attn_weights()
-            self.store_Wov()
+            if store_only_enc_self_attns:
+                if self.is_encoder:
+                    self.store_attn_weights()
+                    self.store_Wov()
+            else:
+                self.store_attn_weights()
+                self.store_Wov()
 
         # update cache length
         if use_cache:
@@ -588,11 +666,6 @@ class TransformerModel(nn.Module):
         data = self.intermediate_tokens
         id2word_size = self.n_words
         plot_title = "Token Table Chart"
-        # be_suspicious = True
-        # with open("imp_params.txt", "r") as file:
-            # be_suspicious = str(file.read()).strip()
-            # be_suspicious = True if be_suspicious == "True" else False
-            # print("be_suspicious: ", be_suspicious, type(be_suspicious))
 
         # ensure we plot relevant decoder blocks only
         if len(data) == 0:
@@ -650,6 +723,17 @@ class TransformerModel(nn.Module):
             data[new_key] = new_value
             with open("all_intermediate_tokens.json", "w") as file:
                 json.dump(data, file, indent=4)
+            
+    def store_intermediate_logits_func(self):
+        new_value = self.intermediate_logits
+        if len(new_value) != 0:
+            with open("all_intermediate_logits.json", "r") as file:
+                data = json.load(file)
+            num_pairs = len(data)
+            new_key = "token_"+str(num_pairs)
+            data[new_key] = new_value
+            with open("all_intermediate_logits.json", "w") as file:
+                json.dump(data, file, indent=4)
 
     def store_attn_weights(self):
         new_value = self.stored_attn_weights
@@ -690,6 +774,19 @@ class TransformerModel(nn.Module):
         data[new_key] = new_value
         with open("all_topk.json", "w") as file:
             json.dump(data, file, indent=4)
+
+    def store_enc_outputs_func(self, before_attn,
+                                     after_attn,
+                                     before_ffn,
+                                     after_ffn):
+        dict = {
+            "before_attn": before_attn,
+            "after_attn": after_attn,
+            "before_ffn": before_ffn,
+            "after_ffn": after_ffn
+        }
+        with open("all_enc_outputs.json", "w") as file:
+            json.dump(dict, file, indent=4)
 
     def predict(self, tensor, pred_mask, y, get_scores):
         """

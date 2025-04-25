@@ -37,7 +37,10 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
                 store_attn_pre_softmax=False,
                 store_wov=False,
                 store_value_weighted_attn=False,
+                store_only_enc_self_attns=True,
                 show_topk_tokens=0,
+                store_intermediate_logits=False,
+                store_enc_outputs=False,
                 from_pretrained=False,
                 ignore_enc_layers=[],
                 max_input_points=10000,
@@ -50,6 +53,7 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
         self.model = model
         self.rescale = rescale
         self.params = params
+
         with open("all_intermediate_tokens.json", "w") as file:
             json.dump({}, file)
         with open("all_stored_attentions.json", "w") as file:
@@ -58,6 +62,11 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
             json.dump({}, file)
         with open("all_topk.json", "w") as file:
             json.dump({}, file)
+        with open("all_intermediate_logits.json", "w") as file:
+            json.dump({}, file)
+        with open("all_enc_outputs.json", "w") as file:
+            json.dump({}, file)
+        
         with open("topk.txt", "w") as file:
             file.write(str(show_topk_tokens))
         with open("plot_token_charts.txt", "w") as file:
@@ -70,8 +79,15 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
             file.write(str(" ".join(map(str, ignore_enc_layers))))
         with open("store_value_weighted_attn.txt", "w") as file:
             file.write(str(store_value_weighted_attn))
+        with open("store_intermediate_logits.txt", "w") as file:
+            file.write(str(store_intermediate_logits))
         with open("store_wov.txt", "w") as file:
             file.write(str(store_wov))
+        with open("store_only_enc_self_attns.txt", "w") as file:
+            file.write(str(store_only_enc_self_attns))
+        with open("store_enc_outputs.txt", "w") as file:
+            file.write(str(store_enc_outputs))
+        
         if from_pretrained:
             self.load_pretrained()
         for kwarg, val in model_kwargs.items():
@@ -107,6 +123,13 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
         except:
             return "No intermediate tokens found"
         
+    def get_intermediate_logits(self):
+        try:
+            with open("all_intermediate_logits.json") as file:
+                return json.load(file)
+        except:
+            return "No intermediate logits found"
+        
     def get_stored_attentions(self):
         try:
             with open("all_stored_attentions.json") as file:
@@ -127,6 +150,13 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
                 return json.load(file)
         except:
             return "No topk tokens found"
+        
+    def get_enc_outputs(self):
+        try:
+            with open("all_enc_outputs.json") as file:
+                return json.load(file)
+        except:
+            return "No encoder outputs found"
 
     def set_args(self, args={}):
         for arg, val in args.items():
@@ -212,7 +242,13 @@ class SymbolicTransformerRegressor(BaseEstimator, PredictionIntegrationMixin):
 
         # Forward transformer
         forward_time=_time.time()
+        try:
+            print(f"{np.array(inputs).shape=}")
+        except:
+            pass
+        # print(f"{inputs=}")
         outputs = self.model(inputs)  ##Forward transformer: returns predicted functions
+        # print(f"{outputs=}")
         if verbose: print("Finished forward in {} secs".format(_time.time()-forward_time))
 
         all_candidates = defaultdict(list)
